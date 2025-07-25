@@ -39,7 +39,7 @@ class Upload(models.Model):
 class OutputType(models.TextChoices):
     '''Processing results types'''
 
-    TRANSCRIPT = 'transcript'
+    TRANSCRIPTION = 'transcript'
     SUMMARY = 'summary'
     HIGHLIGHTS = 'highlights'
     AUDIO = 'audio'
