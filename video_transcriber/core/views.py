@@ -19,15 +19,9 @@ def upload_view(request):
             upload.save()
 
             output_types = form.cleaned_data.get('output_types', [])
-            # for output_type in output_types:
-            #     Output.objects.create(
-            #         upload=upload,
-            #         output_type=output_type
-            #     )
             
             if upload.file_url:
                 process_media_from_url.delay(upload.id, output_types)
-
             if upload.file:
                 process_media_from_file.delay(upload.id, output_types)
                 

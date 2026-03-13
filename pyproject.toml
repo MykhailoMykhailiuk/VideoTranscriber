@@ -19,6 +19,7 @@ torch = "^2.7.1"
 torchaudio = "^2.7.1"
 soundfile = "^0.13.1"
 pydub = "^0.25.1"
+deepmultilingualpunctuation = "^1.0.1"
 
 
 [build-system]

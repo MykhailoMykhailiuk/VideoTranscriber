@@ -1,6 +1,7 @@
 import os
 import tempfile
 import logging
+import shutil
 
 import yt_dlp
 import requests
@@ -10,7 +11,8 @@ from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from celery import shared_task, chain
 from moviepy import VideoFileClip
-from transformers import pipeline, WhisperForConditionalGeneration, WhisperProcessor
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
+from deepmultilingualpunctuation import PunctuationModel
 
 from .models import Upload, Output, OutputType
 
@@ -98,20 +100,21 @@ def extract_audio_from_file(self, upload_id, *args, **kwargs):
             os.remove(temp_file.name)
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
 def extract_audio_from_url(self, upload_id, *args, **kwargs):
     logger.info(f"[{self.__name__}] started")
+
+    output_dir = tempfile.gettempdir()
+    downloaded_file = os.path.join(output_dir, f"audio_{upload_id}.mp3")
 
     try:        
         upload = Upload.objects.get(id=upload_id)
 
-        output_dir = tempfile.gettempdir()
-
         ydl_opts = {
             'format': 'bestaudio/best',
+            'ffmpeg_location': shutil.which('ffmpeg'), 
             'retries': 3,
             'outtmpl': os.path.join(output_dir, f"audio_{upload.id}.%(ext)s"),
-            'ffmpeg_location': 'C:/ffmpeg/bin/ffmpeg.exe',
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
@@ -119,29 +122,47 @@ def extract_audio_from_url(self, upload_id, *args, **kwargs):
             'quiet': True,
         }
 
-        downloaded_file = None
-
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(upload.file_url, download=True)
-            downloaded_file = ydl.prepare_filename(info_dict).replace('.webm', '.mp3').replace('.m4a', '.mp3')
+            ydl.extract_info(upload.file_url, download=True)
 
-        if downloaded_file and os.path.exists(downloaded_file):
-            output = Output.objects.create(
-                    upload=upload,
-                    output_type=OutputType.AUDIO
-                )
+        if not os.path.exists(downloaded_file):
+            raise FileNotFoundError(f"Expected audio file not found: {downloaded_file}")
         
-            with open(downloaded_file, 'rb') as audio_file:  
-                output.file.save(
-                    f"audio_{upload.id}.mp3",
-                    ContentFile(audio_file.read()),
-                )
-                output.save()
-            os.remove(downloaded_file)
+        output = Output.objects.create(
+            upload=upload,
+            output_type=OutputType.AUDIO
+            )
+        
+        with open(downloaded_file, 'rb') as audio_file:  
+            output.file.save(
+                f"audio_{upload.id}.mp3",
+                ContentFile(audio_file.read()),
+            )
 
     except Exception as e:
         logger.error(f"[{self.__name__}] Media Processing Error for {upload.file_url} {e}")
-        self.retry(exc=e, countdown=60)
+        raise self.retry(exc=e, countdown=60)
+    
+    finally:
+        if os.path.exists(downloaded_file):
+            os.remove(downloaded_file)
+
+def get_device() -> str:
+    if torch.backends.mps.is_available():
+        return "mps"
+    elif torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+WHISPER_MODEL = None
+WHISPER_PROCESSOR = None
+
+def get_whisper_model_and_processor(device: str):
+    global WHISPER_MODEL, WHISPER_PROCESSOR
+    if WHISPER_MODEL is None or WHISPER_PROCESSOR is None:
+        WHISPER_MODEL = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small").to(device)
+        WHISPER_PROCESSOR = WhisperProcessor.from_pretrained("openai/whisper-small")
+    return WHISPER_MODEL, WHISPER_PROCESSOR
 
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=120)
@@ -156,33 +177,36 @@ def transcribe_media(self, upload_id, *args, **kwargs):
             file__isnull=False
         ).first()
 
-        if not audio and not audio.file:
+        if not audio or not audio.file:
             logger.warning(f"Audio for {upload.id} not found, retrying...")
             raise self.retry(countdown=30)
 
         if not default_storage.exists(audio.file.name):
             logger.error(f"File {audio.file.name} not found in the storage!")
             raise self.retry(countdown=60)
-        
-        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small").to(device)
-        processor = WhisperProcessor.from_pretrained("openai/whisper-small")
+        device = get_device()
+        model, processor = get_whisper_model_and_processor(device)
         audio_path = default_storage.path(audio.file.name)
+
         waveform, sample_rate = torchaudio.load(audio_path)
         if sample_rate != 16000:
-            resampler = torchaudio.transforms.Resample(sample_rate, 16000)
-            waveform = resampler(waveform)
+            waveform = torchaudio.transforms.Resample(sample_rate, 16000)(waveform)
 
+        # mix down to mono if necessary
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
         waveform = waveform[0].numpy()
-        chunk_size = 16000 * 30
+
+        # transcribe in chunks
+        chunk_size = 16000 * 30  # 30 seconds
+        overlap = 16000 * 2  # 2 seconds overlap
         total_length = waveform.shape[0]
         num_chunks = (total_length + chunk_size - 1) // chunk_size
-
         all_text = []
 
         for i in range(num_chunks):
-            start = i * chunk_size
+            start = max(0, i * chunk_size - overlap)
             end = min((i + 1) * chunk_size, total_length)
             chunk = waveform[start:end]
 
@@ -192,16 +216,20 @@ def transcribe_media(self, upload_id, *args, **kwargs):
                 sampling_rate=16000
             ).input_features.to(device)
 
-            generated_ids = model.generate(
-                inputs,
-                language="uk",
-                task="transcribe"
-            )
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    inputs,
+                    task="transcribe",
+                    repetition_penalty=1.3,
+                )
 
             text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
             all_text.append(text.strip())
+            logger.info(f"[{self.__name__}] chunk {i + 1}/{num_chunks} done")
 
-        full_transcript = "".join(all_text)
+        punct_model = PunctuationModel()
+        full_transcript = " ".join(all_text)
+        full_transcript = punct_model.restore_punctuation(full_transcript)
 
         output = Output.objects.create(
             upload=upload,
@@ -215,7 +243,8 @@ def transcribe_media(self, upload_id, *args, **kwargs):
         raise self.retry(countdown=120)
 
     except Exception as e:
-        logger.error(f"[{self.__name__}] Transcribing error for {upload_id} {e}")
+        import traceback
+        logger.error(f"[{self.__name__}] Transcribing error for {upload_id} {e}\n{traceback.format_exc()}")
         raise self.retry(exc=e, countdown=120)
 
 
@@ -229,13 +258,13 @@ def process_media_from_file(self, upload_id, output_types):
         if not upload.file:
             logger.error(f"File {upload.id} not found!")
         
-        if OutputType.AUDIO in output_types:
-            extract_audio_from_file.delay(upload.id)
-        elif OutputType.TRANSCRIPTION in output_types:
+        if OutputType.TRANSCRIPTION in output_types:
             chain(
                 extract_audio_from_file.s(upload.id),
                 transcribe_media.si(upload.id)
             ).apply_async()
+        elif OutputType.AUDIO in output_types:
+            extract_audio_from_file.delay(upload.id)
 
     except Exception as e:
         logger.error(f"[{self.__name__}] Media Processing Error for {upload.file} {e}")
@@ -254,13 +283,13 @@ def process_media_from_url(self, upload_id, output_types):
         
         exctract_thumbnail_and_title.delay(upload.id)
 
-        if OutputType.AUDIO in output_types:
-            extract_audio_from_url.delay(upload.id)
-        elif OutputType.TRANSCRIPTION in output_types:
+        if OutputType.TRANSCRIPTION in output_types:
             chain(
                 extract_audio_from_url.s(upload.id),
                 transcribe_media.si(upload.id)
             ).apply_async()
+        elif OutputType.AUDIO in output_types:
+            extract_audio_from_url.delay(upload.id)
 
     except Exception as e:
         logger.error(f"[{self.__name__}] Media Processing Error for {upload.file_url} {e}")
