@@ -21,7 +21,7 @@
                 {% endif %}
               </a>
             {% elif upload.file %}
-              <video class="card-img-top" controls>
+              <video class="card-img-top" controls style="height: 200px; object-fit: cover;">
                 <source src="{{ upload.file.url }}" type="video/mp4">
                 Your browser does not support the video tag.
               </video>
@@ -30,6 +30,19 @@
               <p class="card-text">
                 {{ upload.get_filename }}
               </p>
+              
+              <!-- Status badge -->
+              <div class="mb-3">
+                {% if upload.status == 'pending' %}
+                  <span class="badge bg-info"><i class="bi bi-hourglass-split"></i> Pending</span>
+                {% elif upload.status == 'processing' %}
+                  <span class="badge bg-warning"><i class="bi bi-arrow-repeat"></i> Processing...</span>
+                {% elif upload.status == 'completed' %}
+                  <span class="badge bg-success"><i class="bi bi-check-circle"></i> Completed</span>
+                {% elif upload.status == 'failed' %}
+                  <span class="badge bg-danger"><i class="bi bi-exclamation-triangle"></i> Failed</span>
+                {% endif %}
+              </div>
             </div>
 
             <div class="card-footer bg-transparent border-top-0">
@@ -46,5 +59,18 @@
     <p>It seems you don't have any files yet</p>
   {% endif %}
 </div>
+
+<script>
+  // Optional: Refresh upload status periodically to reflect server changes
+  function refreshDashboard() {
+    location.reload();
+  }
+  
+  // Refresh every 30 seconds when uploads are processing
+  const uploads = document.querySelectorAll('[class*="badge-warning"]');
+  if (uploads.length > 0) {
+    setInterval(refreshDashboard, 30000);
+  }
+</script>
 
 {% endblock %}

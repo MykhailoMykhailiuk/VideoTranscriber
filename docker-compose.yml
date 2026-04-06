@@ -11,7 +11,7 @@ services:
   web:
     build: .
     working_dir: /app/video_transcriber
-    command: python manage.py runserver 0.0.0.0:8000
+    command: daphne -b 0.0.0.0 -p 8000 video_transcriber.asgi:application
     volumes:
       - .:/app
     ports:

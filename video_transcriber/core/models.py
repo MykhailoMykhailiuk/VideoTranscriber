@@ -41,11 +41,19 @@ def file_path(instance, filename):
         return f"{instance.upload.user.username}/outputs/{type_folder}/{stem}_{instance.output_type}_{instance.upload.id}{ext}"
 
 
+class UploadStatus(models.TextChoices):
+    PENDING = 'pending'
+    PROCESSING = 'processing'
+    COMPLETED = 'completed'
+    FAILED = 'failed'
+
+
 class Upload(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE)
     file = models.FileField(upload_to=file_path, blank=True, null=True)
     file_url = models.URLField(blank=True, null=True)
     thumbnail = models.ImageField(upload_to=file_path, blank=True, null=True)
+    status = models.CharField(max_length=20, choices=UploadStatus.choices, default=UploadStatus.PENDING)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

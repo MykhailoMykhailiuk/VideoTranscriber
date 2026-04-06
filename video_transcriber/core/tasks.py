@@ -11,10 +11,16 @@ from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from celery import shared_task, chain
 from moviepy import VideoFileClip
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
+from transformers import (
+    WhisperForConditionalGeneration,
+    WhisperProcessor,
+    pipeline, 
+    AutoTokenizer
+)
 from deepmultilingualpunctuation import PunctuationModel
 
-from .models import Upload, Output, OutputType
+from .models import Upload, Output, OutputType, UploadStatus
+from .utils import send_upload_notification
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +29,25 @@ def check_existing(upload, output_type, required_file=False):
     if required_file:
         query = query.filter(file__isnull=False)
     return query.exists()
+
+def set_upload_status(upload_id: int, status: str):
+    try:
+        upload = Upload.objects.get(id=upload_id)
+        upload.status = status
+        upload.save()
+        
+        # Send WebSocket notification
+        status_messages = {
+            UploadStatus.PENDING: "📋 Upload created",
+            UploadStatus.PROCESSING: "⏳ Processing started",
+            UploadStatus.COMPLETED: "✅ Processing completed",
+            UploadStatus.FAILED: "❌ Processing failed",
+        }
+        
+        message = status_messages.get(status, f"Status: {status}")
+        send_upload_notification(upload.user_id, upload_id, status, message)
+    except Upload.DoesNotExist:
+        logger.error(f"Upload with id {upload_id} does not exist")
 
 
 @shared_task(bind=True)
@@ -73,6 +98,7 @@ def exctract_thumbnail_and_title(self, upload_id, *args, **kwargs):
 
     except Exception as e:
         logger.error(f"[{self.__name__}] Media Processing Error for {upload.file_url} {e}")
+        set_upload_status(upload_id, UploadStatus.FAILED)
         self.retry(exc=e, countdown=60)
 
 
@@ -107,6 +133,7 @@ def extract_audio_from_file(self, upload_id, *args, **kwargs):
 
     except Exception as e:
         logger.error(f"[{self.__name__}] Media Processing Error for {upload.file} {e}")
+        set_upload_status(upload_id, UploadStatus.FAILED)
         raise self.retry(exc=e)
 
     finally:
@@ -159,6 +186,7 @@ def extract_audio_from_url(self, upload_id, *args, **kwargs):
 
     except Exception as e:
         logger.error(f"[{self.__name__}] Media Processing Error for {upload.file_url} {e}")
+        set_upload_status(upload_id, UploadStatus.FAILED)
         raise self.retry(exc=e, countdown=60)
     
     finally:
@@ -267,7 +295,140 @@ def transcribe_media(self, upload_id, *args, **kwargs):
     except Exception as e:
         import traceback
         logger.error(f"[{self.__name__}] Transcribing error for {upload_id} {e}\n{traceback.format_exc()}")
+        set_upload_status(upload_id, UploadStatus.FAILED)
         raise self.retry(exc=e, countdown=120)
+
+SUMMARIZER = None
+SUMMARIZER_TOKENIZER = None
+
+def get_summarizer():
+    global SUMMARIZER, SUMMARIZER_TOKENIZER
+    if SUMMARIZER is None:
+        model_name = "google/mt5-small"
+        SUMMARIZER_TOKENIZER = AutoTokenizer.from_pretrained(
+            model_name,
+            model_max_length=512
+        )
+        SUMMARIZER = pipeline(
+            "summarization",
+            model=model_name,
+            tokenizer=SUMMARIZER_TOKENIZER
+        )
+    return SUMMARIZER
+
+def chunk_text(text: str, max_words: int) -> list[str]:
+    words = text.split()
+    chunks = []
+
+    for i in range(0, len(words), max_words):
+        chunks.append(" ".join(words[i:i + max_words]))
+    
+    return chunks
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=120)
+def summarize_transcription(self, upload_id, *args, **kwargs):
+    logger.info(f"[{self.__name__}] started")
+
+    try:
+        upload = Upload.objects.get(id=upload_id)
+    
+        if check_existing(upload=upload, output_type=OutputType.SUMMARY):
+            logger.info(f"Summary already exists for {upload_id}, skipping")
+            return
+        
+        transcript = Output.objects.filter(
+            upload=upload,
+            output_type=OutputType.TRANSCRIPTION
+        ).first()
+
+        if not transcript or not transcript.content:
+            logger.warning(f"Transcription for {upload_id} not found, retrying...")
+            raise self.retry(countdown=30)
+        
+        if len(transcript.content.strip()) < 50:
+            logger.warning(f"Transcription for {upload_id} is too short to summarize: '{transcript.content}'")
+            return
+        
+        logger.info(f"Transcript length for {upload_id}: {len(transcript.content)} chars, {len(transcript.content.split())} words")
+        summarizer = get_summarizer()
+        chunks = chunk_text(transcript.content, max_words=150)
+
+        chunk_summaries = []
+        for chunk in chunks:
+            result = summarizer(
+                chunk,
+                max_length=200,
+                min_length=50,
+                do_sample=False,
+                truncation=True
+            )
+            chunk_summaries.append(result[0]['summary_text'])
+            logger.info(f"[{self.__name__}] chunk {chunks.index(chunk) + 1}/{len(chunks)} done")
+
+        if len(chunk_summaries) > 1:
+            combined = " ".join(chunk_summaries)
+            combined = " ".join(combined.split()[:700])
+
+            final_summary = summarizer(
+                combined,
+                max_length=150,
+                min_length=30,
+                do_sample=False,
+                truncation=True
+            )[0]['summary_text']
+
+        else:
+            final_summary = chunk_summaries[0]
+
+        output = Output.objects.create(
+            upload=upload,
+            output_type=OutputType.SUMMARY,
+            content=final_summary
+        )
+
+        logger.info(f"[Summary saved for Upload {upload.id} with Output {output.id}]")
+
+    except Exception as e:
+        logger.error(f"[{self.__name__}] Summarizing error for {upload_id} {e}")
+        set_upload_status(upload_id, UploadStatus.FAILED)
+        raise self.retry(exc=e, countdown=120)
+
+
+
+@shared_task(bind=True)
+def set_upload_status_completed(self, upload_id):
+    set_upload_status(upload_id, UploadStatus.COMPLETED)
+    logger.info(f"Upload {upload_id} marked as COMPLETED")
+
+
+def build_pipeline(upload_id: int, output_types: list, source: str) -> list:
+    '''Returns a list of tasks to be executed for the given upload and output types
+    
+    upload_id: int: ID of the Upload object
+    output_types: list: List of OutputType values to be generated
+    source: str: 'file' or 'url' indicating the source of the media  
+    '''
+
+    tasks = []
+
+    if source == 'url':
+        tasks.append(exctract_thumbnail_and_title.si(upload_id))
+    
+    if any(ot in output_types for ot in [OutputType.AUDIO, OutputType.TRANSCRIPTION, OutputType.SUMMARY]):
+        if source == 'url':
+            tasks.append(extract_audio_from_url.si(upload_id))
+        else:
+            tasks.append(extract_audio_from_file.si(upload_id))
+
+    if OutputType.TRANSCRIPTION in output_types or OutputType.SUMMARY in output_types:
+        tasks.append(transcribe_media.si(upload_id))
+
+    if OutputType.SUMMARY in output_types:
+        tasks.append(summarize_transcription.si(upload_id))
+
+    tasks.append(set_upload_status_completed.si(upload_id))
+
+    return tasks
 
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=120)
@@ -281,13 +442,10 @@ def process_media_from_file(self, upload_id, output_types):
             logger.error(f"File {upload.id} not found!")
             return
         
-        if OutputType.TRANSCRIPTION in output_types:
-            chain(
-                extract_audio_from_file.si(upload.id),
-                transcribe_media.si(upload.id)
-            ).apply_async()
-        elif OutputType.AUDIO in output_types:
-            extract_audio_from_file.delay(upload.id)
+        set_upload_status(upload_id, UploadStatus.PROCESSING)
+        tasks = build_pipeline(upload_id=upload_id, output_types=output_types, source='file')
+        if tasks:
+            chain(*tasks).apply_async()
 
     except Exception as e:
         logger.error(f"[{self.__name__}] Media Processing Error for {upload.file} {e}")
@@ -304,20 +462,11 @@ def process_media_from_url(self, upload_id, output_types):
         if not upload.file_url:
             logger.error(f"Upload {upload_id} has no URL!")
             return
-
-        if OutputType.TRANSCRIPTION in output_types:
-            chain(
-                exctract_thumbnail_and_title.si(upload.id),
-                extract_audio_from_url.si(upload.id),
-                transcribe_media.si(upload.id)
-            ).apply_async()
-        elif OutputType.AUDIO in output_types:
-            chain(
-                exctract_thumbnail_and_title.si(upload.id),
-                extract_audio_from_url.si(upload.id)
-            ).apply_async()
-        else:
-            exctract_thumbnail_and_title.delay(upload.id)
+        
+        set_upload_status(upload_id, UploadStatus.PROCESSING)
+        tasks = build_pipeline(upload_id=upload_id, output_types=output_types, source='url')
+        if tasks:
+            chain(*tasks).apply_async()
 
     except Exception as e:
         logger.error(f"[{self.__name__}] Media Processing Error for {upload.file_url} {e}")
