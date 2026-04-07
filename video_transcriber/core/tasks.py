@@ -1,36 +1,44 @@
 import os
 import tempfile
 import logging
-import shutil
 
-import yt_dlp
 import requests
-import torch
-import torchaudio
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from celery import shared_task, chain
-from moviepy import VideoFileClip
-from transformers import (
-    WhisperForConditionalGeneration,
-    WhisperProcessor,
-    pipeline, 
-    AutoTokenizer
-)
-from deepmultilingualpunctuation import PunctuationModel
+
 
 from .models import Upload, Output, OutputType, UploadStatus
 from .utils import send_upload_notification
+from processing.thumbnail import get_thumbnail_and_title
+from processing.audio import get_audio_from_url, get_audio_from_video_file
+from processing.transcription import transcribe_audio
+from processing.summarization import summarize_text
 
 logger = logging.getLogger(__name__)
 
 def check_existing(upload, output_type, required_file=False):
+    '''
+    Check if an output of the given type already exists for the upload.
+    If required_file is True, it will only return True if the output has a file associated with it.
+
+    upload: Upload object to check for
+    output_type: OutputType to check for
+    required_file: If True, only return True if the output has a file associated with it
+    return: True if an output of the given type already exists for the upload, False otherwise
+    '''
     query = Output.objects.filter(upload=upload, output_type=output_type)
     if required_file:
         query = query.filter(file__isnull=False)
     return query.exists()
 
 def set_upload_status(upload_id: int, status: str):
+    '''
+    Update the status of the upload and send a WebSocket notification to the user.
+
+    upload_id: ID of the Upload object to update
+    status: New status to set for the upload
+    '''
     try:
         upload = Upload.objects.get(id=upload_id)
         upload.status = status
@@ -52,6 +60,12 @@ def set_upload_status(upload_id: int, status: str):
 
 @shared_task(bind=True)
 def exctract_thumbnail_and_title(self, upload_id, *args, **kwargs):
+    '''
+    Extract the thumbnail and title from the video URL and save them to the Upload object.
+    This task is only executed for uploads with a file_url (i.e., media from URLs like YouTube).
+
+    upload_id: ID of the Upload object to update
+    '''
     logger.info(f"[{self.__name__}] started")
 
     try:
@@ -61,40 +75,22 @@ def exctract_thumbnail_and_title(self, upload_id, *args, **kwargs):
             logger.info(f"Thumbnail already exists for Upload {upload.id}, skipping extraction")
             return
 
-        ydl_opts = {
-            'quiet': True,
-            'skip_download': True,
-            'noplaylist': True,
-            'extract_flat': True,
-            'referer': upload.file_url,
-            'http_headers': {'User-Agent': 'Mozilla/5.0'},
-        }
+        title, thumbnail_url = get_thumbnail_and_title(upload.file_url, upload.id)
+        upload.file = title
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(upload.file_url, download=False)
+        if thumbnail_url:
+            try:
+                response = requests.get(thumbnail_url, timeout=10)
+                if response.status_code == 200:
+                    upload.thumbnail.save(
+                        f"thumb_{upload.id}.jpg",
+                        ContentFile(response.content),
+                        save=True
+                    )
+            except Exception as e:
+                print(f"[Thumbnail Download Error] {e}")
 
-            upload.file = info.get('title') or (info.get('description', '')[:100] if info.get('description') else f"video_{upload.id}")
-
-            thumbnails = info.get('thumbnail', [])
-            thumbnail_url = (
-                info.get('thumbnail') or
-                (thumbnails[-1]['url'] if thumbnails else None) or
-                (info.get('avatar', {}).get('url'))
-            )
-
-            if thumbnail_url:
-                try:
-                    response = requests.get(thumbnail_url, timeout=10)
-                    if response.status_code == 200:
-                        upload.thumbnail.save(
-                            f"thumb_{upload.id}.jpg",
-                            ContentFile(response.content),
-                            save=True
-                        )
-                except Exception as e:
-                    print(f"[Thumbnail Download Error] {e}")
-
-            upload.save()
+        upload.save()
 
     except Exception as e:
         logger.error(f"[{self.__name__}] Media Processing Error for {upload.file_url} {e}")
@@ -104,6 +100,14 @@ def exctract_thumbnail_and_title(self, upload_id, *args, **kwargs):
 
 @shared_task(bind=True, max_retries=2, default_retry_delay=60)
 def extract_audio_from_file(self, upload_id, *args, **kwargs):
+    '''
+    Extract the audio from the uploaded video file and save it as an Output of type AUDIO.
+    This task is only executed for uploads with a file (i.e., media uploaded directly to the platform).
+        - A temporary file is created to store the extracted audio, which is then saved to the Output model.
+        - The temporary file is deleted after the audio has been saved to ensure that no unnecessary files are left on the server.
+    
+    upload_id: ID of the Upload object to process
+    '''
     logger.info(f"[{self.__name__}] started")
 
     temp_file = None
@@ -116,20 +120,19 @@ def extract_audio_from_file(self, upload_id, *args, **kwargs):
             return
 
         with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
-            with VideoFileClip(upload.file.path) as clip:
-                clip.audio.write_audiofile(temp_file.name)
+            get_audio_from_video_file(upload.file.path, temp_file.name)
 
-            output = Output.objects.create(
-                    upload=upload,
-                    output_type=OutputType.AUDIO
-                )
+        output = Output.objects.create(
+                upload=upload,
+                output_type=OutputType.AUDIO
+            )
 
-            with open(temp_file.name, 'rb') as audio_file:  
-                output.file.save(
-                    f"audio_{upload.id}.mp3",
-                    ContentFile(audio_file.read()),
-                )
-                output.save()
+        with open(temp_file.name, 'rb') as audio_file:  
+            output.file.save(
+                f"audio_{upload.id}.mp3",
+                ContentFile(audio_file.read()),
+            )
+            output.save()
 
     except Exception as e:
         logger.error(f"[{self.__name__}] Media Processing Error for {upload.file} {e}")
@@ -143,10 +146,16 @@ def extract_audio_from_file(self, upload_id, *args, **kwargs):
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=60)
 def extract_audio_from_url(self, upload_id, *args, **kwargs):
+    '''
+    Extract the audio from the video URL and save it as an Output of type AUDIO.
+    This task is only executed for uploads with a file_url (i.e., media from URLs like YouTube).
+        - The audio is downloaded directly from the URL and saved to the Output model 
+        without the need for a temporary file, as the audio is streamed and saved in chunks 
+        to handle large files efficiently.
+    
+    upload_id: ID of the Upload object to process
+    '''
     logger.info(f"[{self.__name__}] started")
-
-    output_dir = tempfile.gettempdir()
-    downloaded_file = os.path.join(output_dir, f"audio_{upload_id}.mp3")
 
     try:        
         upload = Upload.objects.get(id=upload_id)
@@ -155,23 +164,7 @@ def extract_audio_from_url(self, upload_id, *args, **kwargs):
             logger.info(f"Audio for Upload {upload.id} already exists, skipping extraction")
             return
 
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'ffmpeg_location': shutil.which('ffmpeg'), 
-            'retries': 3,
-            'outtmpl': os.path.join(output_dir, f"audio_{upload.id}.%(ext)s"),
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-            }],
-            'quiet': True,
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.extract_info(upload.file_url, download=True)
-
-        if not os.path.exists(downloaded_file):
-            raise FileNotFoundError(f"Expected audio file not found: {downloaded_file}")
+        downloaded_file = get_audio_from_url(upload.file_url, upload.id)
         
         output = Output.objects.create(
             upload=upload,
@@ -193,26 +186,18 @@ def extract_audio_from_url(self, upload_id, *args, **kwargs):
         if os.path.exists(downloaded_file):
             os.remove(downloaded_file)
 
-def get_device() -> str:
-    if torch.backends.mps.is_available():
-        return "mps"
-    elif torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
-
-WHISPER_MODEL = None
-WHISPER_PROCESSOR = None
-
-def get_whisper_model_and_processor(device: str):
-    global WHISPER_MODEL, WHISPER_PROCESSOR
-    if WHISPER_MODEL is None or WHISPER_PROCESSOR is None:
-        WHISPER_MODEL = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small").to(device)
-        WHISPER_PROCESSOR = WhisperProcessor.from_pretrained("openai/whisper-small")
-    return WHISPER_MODEL, WHISPER_PROCESSOR
-
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=120)
 def transcribe_media(self, upload_id, *args, **kwargs):
+    '''
+    Transcribe the audio from the media and save it as an Output of type TRANSCRIPTION.
+        - The audio file is retrieved from the Output model, 
+        and the transcription is performed using the transcribe_audio function.
+        - The resulting transcription is saved as a new Output of type TRANSCRIPTION 
+        associated with the same Upload.   
+    
+    upload_id: ID of the Upload object to process
+    '''
     logger.info(f"[{self.__name__}] started")
     try:
         upload = Upload.objects.get(id=upload_id)
@@ -235,52 +220,9 @@ def transcribe_media(self, upload_id, *args, **kwargs):
             logger.error(f"File {audio.file.name} not found in the storage!")
             raise self.retry(countdown=60)
 
-        device = get_device()
-        model, processor = get_whisper_model_and_processor(device)
         audio_path = default_storage.path(audio.file.name)
-
-        waveform, sample_rate = torchaudio.load(audio_path)
-        if sample_rate != 16000:
-            waveform = torchaudio.transforms.Resample(sample_rate, 16000)(waveform)
-
-        # mix down to mono if necessary
-        if waveform.shape[0] > 1:
-            waveform = torch.mean(waveform, dim=0, keepdim=True)
-        waveform = waveform[0].numpy()
-
-        # transcribe in chunks
-        chunk_size = 16000 * 30  # 30 seconds
-        overlap = 16000 * 2  # 2 seconds overlap
-        total_length = waveform.shape[0]
-        num_chunks = (total_length + chunk_size - 1) // chunk_size
-        all_text = []
-
-        for i in range(num_chunks):
-            start = max(0, i * chunk_size - overlap)
-            end = min((i + 1) * chunk_size, total_length)
-            chunk = waveform[start:end]
-
-            inputs = processor(
-                chunk, 
-                return_tensors="pt",
-                sampling_rate=16000
-            ).input_features.to(device)
-
-            with torch.no_grad():
-                generated_ids = model.generate(
-                    inputs,
-                    task="transcribe",
-                    repetition_penalty=1.3,
-                )
-
-            text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            all_text.append(text.strip())
-            logger.info(f"[{self.__name__}] chunk {i + 1}/{num_chunks} done")
-
-        punct_model = PunctuationModel()
-        full_transcript = " ".join(all_text)
-        full_transcript = punct_model.restore_punctuation(full_transcript)
-
+        full_transcript = transcribe_audio(audio_path)
+        
         output = Output.objects.create(
             upload=upload,
             output_type=OutputType.TRANSCRIPTION,
@@ -293,40 +235,26 @@ def transcribe_media(self, upload_id, *args, **kwargs):
         raise self.retry(countdown=120)
 
     except Exception as e:
-        import traceback
-        logger.error(f"[{self.__name__}] Transcribing error for {upload_id} {e}\n{traceback.format_exc()}")
+        logger.error(f"[{self.__name__}] Transcribing error for {upload_id} {e}")
         set_upload_status(upload_id, UploadStatus.FAILED)
         raise self.retry(exc=e, countdown=120)
 
-SUMMARIZER = None
-SUMMARIZER_TOKENIZER = None
-
-def get_summarizer():
-    global SUMMARIZER, SUMMARIZER_TOKENIZER
-    if SUMMARIZER is None:
-        model_name = "google/mt5-small"
-        SUMMARIZER_TOKENIZER = AutoTokenizer.from_pretrained(
-            model_name,
-            model_max_length=512
-        )
-        SUMMARIZER = pipeline(
-            "summarization",
-            model=model_name,
-            tokenizer=SUMMARIZER_TOKENIZER
-        )
-    return SUMMARIZER
-
-def chunk_text(text: str, max_words: int) -> list[str]:
-    words = text.split()
-    chunks = []
-
-    for i in range(0, len(words), max_words):
-        chunks.append(" ".join(words[i:i + max_words]))
-    
-    return chunks
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=120)
 def summarize_transcription(self, upload_id, *args, **kwargs):
+    '''
+    Summarize the transcription of the media and save it as an Output of type SUMMARY.
+        - The transcription text is retrieved from the Output model, 
+        and the summarization is performed using the summarize_text function.
+        - The resulting summary is saved as a new Output of type SUMMARY 
+        associated with the same Upload. 
+        - The summarization process includes dynamic adjustment of the max_length 
+        and min_length parameters based on the token count of the input text to ensure 
+        that the summarization is effective and does not exceed the model input limits. 
+        - The final summary is truncated to 700 characters to ensure it is concise and suitable for display.
+    
+    upload_id: ID of the Upload object to process
+    '''
     logger.info(f"[{self.__name__}] started")
 
     try:
@@ -350,35 +278,8 @@ def summarize_transcription(self, upload_id, *args, **kwargs):
             return
         
         logger.info(f"Transcript length for {upload_id}: {len(transcript.content)} chars, {len(transcript.content.split())} words")
-        summarizer = get_summarizer()
-        chunks = chunk_text(transcript.content, max_words=150)
 
-        chunk_summaries = []
-        for chunk in chunks:
-            result = summarizer(
-                chunk,
-                max_length=200,
-                min_length=50,
-                do_sample=False,
-                truncation=True
-            )
-            chunk_summaries.append(result[0]['summary_text'])
-            logger.info(f"[{self.__name__}] chunk {chunks.index(chunk) + 1}/{len(chunks)} done")
-
-        if len(chunk_summaries) > 1:
-            combined = " ".join(chunk_summaries)
-            combined = " ".join(combined.split()[:700])
-
-            final_summary = summarizer(
-                combined,
-                max_length=150,
-                min_length=30,
-                do_sample=False,
-                truncation=True
-            )[0]['summary_text']
-
-        else:
-            final_summary = chunk_summaries[0]
+        final_summary = summarize_text(transcript.content)
 
         output = Output.objects.create(
             upload=upload,
@@ -397,16 +298,38 @@ def summarize_transcription(self, upload_id, *args, **kwargs):
 
 @shared_task(bind=True)
 def set_upload_status_completed(self, upload_id):
+    '''
+    Mark the upload as completed.
+        - This task is executed at the end of the processing pipeline 
+        to update the status of the upload to COMPLETED and send a final notification to the user.
+
+    upload_id: ID of the Upload object to update
+    '''
     set_upload_status(upload_id, UploadStatus.COMPLETED)
     logger.info(f"Upload {upload_id} marked as COMPLETED")
 
 
 def build_pipeline(upload_id: int, output_types: list, source: str) -> list:
-    '''Returns a list of tasks to be executed for the given upload and output types
+    '''
+    Returns a list of tasks to be executed for the given upload and output types in the correct order.
+     - The pipeline is built based on the source of the media (file or URL) 
+     and the requested output types (AUDIO, TRANSCRIPTION, SUMMARY).
+     - For URL sources, the thumbnail and title extraction task 
+     is included at the beginning of the pipeline.
+     - The audio extraction task is included if any of the requested output types 
+     require audio (AUDIO, TRANSCRIPTION, SUMMARY), with the specific task chosen based on the source type.
+     - The transcription task is included if either TRANSCRIPTION or SUMMARY is requested, 
+     as both require the transcription to be generated first.
+     - The summarization task is included if SUMMARY is requested, 
+     and it is placed after the transcription task since it depends on the transcription output.
+     - Finally, the task to set the upload status to COMPLETED is included 
+     at the end of the pipeline to ensure that the status is only updated 
+     after all processing tasks have been executed.
     
     upload_id: int: ID of the Upload object
     output_types: list: List of OutputType values to be generated
     source: str: 'file' or 'url' indicating the source of the media  
+    return: List of tasks to be executed
     '''
 
     tasks = []
@@ -433,6 +356,24 @@ def build_pipeline(upload_id: int, output_types: list, source: str) -> list:
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=120)
 def process_media_from_file(self, upload_id, output_types):
+    '''
+    Entry-point Celery task for processing media uploaded as a file.
+
+    - This task initializes the processing pipeline for a file-based upload.
+    - It first validates that the Upload object exists and contains a file.
+    - The upload status is then set to PROCESSING to indicate that background 
+      processing has started.
+    - A pipeline of dependent Celery tasks is dynamically built using 
+      the build_pipeline function based on the requested output types 
+      (AUDIO, TRANSCRIPTION, SUMMARY).
+    - The pipeline is executed asynchronously using a Celery chain, ensuring 
+      that tasks run sequentially in the correct order.
+    - If any error occurs during setup, the task is retried according to 
+      the configured retry policy.
+
+    upload_id: int: ID of the Upload object
+    output_types: list: List of OutputType values to be generated
+    '''
     logger.info(f"[{self.__name__}] started")
 
     try:
@@ -454,6 +395,24 @@ def process_media_from_file(self, upload_id, output_types):
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=120)
 def process_media_from_url(self, upload_id, output_types):
+    '''
+    Entry-point Celery task for processing media provided via URL.
+
+    - This task initializes the processing pipeline for a URL-based upload.
+    - It validates that the Upload object exists and contains a valid file_url.
+    - The upload status is set to PROCESSING to indicate that background 
+      processing has started.
+    - A pipeline of dependent Celery tasks is dynamically built using 
+      the build_pipeline function, which includes additional steps specific 
+      to URL sources (e.g., thumbnail and metadata extraction).
+    - The pipeline is executed asynchronously using a Celery chain, ensuring 
+      that all tasks are processed in the correct sequence.
+    - If an error occurs during initialization, the task is retried 
+      based on the configured retry policy.
+
+    upload_id: int: ID of the Upload object
+    output_types: list: List of OutputType values to be generated
+    '''
     logger.info(f"[{self.__name__}] started")
 
     try:
