@@ -32,6 +32,7 @@
             </label>
             <span>{{form.errors.password}}</span>
         </div>
+        <a href="{% url 'accounts:password_reset' %}">Forgot password?</a><br>
         <button type="submit" class="btn btn-primary">Submit</button>
         <button type="reset" class="btn btn-secondary">Reset</button>
     </form>

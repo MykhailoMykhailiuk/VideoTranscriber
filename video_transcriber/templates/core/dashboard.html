@@ -48,7 +48,7 @@
             <div class="card-footer bg-transparent border-top-0">
               <div class="d-flex justify-content-between align-items-center">
                 <small class="text-muted">{{ upload.created_at|date:"d M Y, H:i" }}</small>
-                <a href="#" class="text-dark text-decoration-none hover-text-primary">Related files</a>
+                <a href="{% url 'releted_files' upload.id %}" class="text-dark text-decoration-none hover-text-primary">Related files</a>
               </div>
             </div>
           </div>

@@ -52,3 +52,14 @@ def upload_view(request):
 def dashboard_view(request):
     uploads = Upload.objects.filter(user=request.user).order_by('-created_at')
     return render(request, template_name='core/dashboard.html', context={'uploads': uploads})
+
+
+@login_required
+def output_view(request, upload_id):
+    upload = Upload.objects.filter(id=upload_id, user=request.user).first()
+
+    if not upload:
+        return redirect(to='dashboard')
+    
+    outputs = Output.objects.filter(upload=upload)
+    return render(request, template_name='core/releted_files.html', context={'upload': upload, 'outputs': outputs})

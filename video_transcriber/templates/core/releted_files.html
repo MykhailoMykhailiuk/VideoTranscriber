@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% load static %}
+
+{% block content %}
+<div class="container py-4">
+    {% if upload %}
+  <h2 class="mb-4">Related files for {{upload.file}}</h2>
+    <div class="card h-50 shadow-sm">
+      <div class="card-body">
+        <ul class="list-group list-group-flush">
+          {% for output in outputs %}
+            <li class="list-group-item">
+              <p class="card-text"><strong>{{ output.output_type }}</strong></p>
+                {% if output.file %}
+              <a href="{{ output.file }}" target="_blank">{{ output.file }}</a>
+              <span class="text-muted float-end">{{ output.created_at|date:"d M Y, H:i" }}</span>
+                {% endif %}
+
+                {% if output.content %}
+              <p class="card-text">{{ output.content }}</p>
+              <span class="text-muted float-end">{{ output.created_at|date:"d M Y, H:i" }}</span>
+                {% endif %}
+            </li>
+            {% empty %}
+            <li class="list-group-item">No related files found.</li>
+          {% endfor %}
+        </ul>
+      </div>
+    {% endif%}
+
+{% endblock %}
